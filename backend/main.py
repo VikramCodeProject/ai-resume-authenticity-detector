@@ -3,7 +3,7 @@ Resume Truth Verification System - Backend Main Application
 FastAPI application with async support, JWT authentication, and full integration
 """
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Header
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -29,12 +29,14 @@ from services import (
     get_llm_service,
     get_deepfake_detector
 )
+from api.routes import router as enterprise_router
+from monitoring.metrics import metrics_middleware, metrics_response
+from utils.exceptions import BlockchainError, OCRProcessingError, ResumeVerificationError
+from utils.logger import request_logging_middleware, setup_logging
+from utils.rate_limiter import SlowAPIMiddleware
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # ===================== CONFIGURATION =====================
@@ -66,6 +68,7 @@ class Settings:
     MAX_RESUMES_PER_USER: int = 50
     ACCOUNT_LOCKOUT_THRESHOLD: int = 5
     ACCOUNT_LOCKOUT_DURATION_MINUTES: int = 15
+    RATE_LIMIT: str = os.getenv('RATE_LIMIT', '10/minute')
     ALLOWED_ORIGINS: list = [
         'http://localhost:3000',
         'http://localhost:8000',
@@ -449,6 +452,8 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.state.limiter = None  # Rate limiting now via Depends injection
+
 # Add middleware
 app.add_middleware(
     CORSMiddleware,
@@ -462,6 +467,15 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["localhost", "127.0.0.1"]
 )
+
+app.middleware("http")(metrics_middleware)
+app.middleware("http")(request_logging_middleware)
+app.include_router(enterprise_router, prefix="/api")
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    return metrics_response()
 
 # ===================== DEPENDENCY FUNCTIONS =====================
 
@@ -792,262 +806,9 @@ async def list_resumes(current_user: dict = Depends(verify_token)):
     }
 
 # Verification endpoints
-@app.post("/api/verify/github", tags=["Verification"])
-async def verify_github_profile(
-    request: GitHubVerificationRequest
-):
-    """
-    Real GitHub API verification with authenticity scoring
-    
-    Features:
-    - Repository analysis
-    - Language matching
-    - Activity scoring
-    - Redis caching
-    """
-    logger.info(f"GitHub verification started for: {request.username}")
-    
-    try:
-        github_service = get_github_service(
-            api_token=get_settings().GITHUB_API_KEY
-        )
-        
-        result = await github_service.verify_profile(
-            username=request.username,
-            claimed_skills=request.claimed_skills
-        )
-        
-        return result
-    
-    except Exception as e:
-        logger.exception(f"GitHub verification error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"GitHub verification failed: {str(e)}"
-        )
 
-@app.post("/api/verify/certificate", tags=["Verification"])
-async def verify_certificate(
-    file: UploadFile = File(...),
-    expected_name: Optional[str] = None,
-    resume_id: Optional[str] = None
-):
-    """
-    OCR-based certificate verification
-    
-    Features:
-    - Tesseract/EasyOCR text extraction
-    - Entity extraction (name, issuer, date, ID)
-    - Issuer whitelist validation
-    - Duplicate detection
-    - Tamper detection
-    """
-    logger.info(f"Certificate verification started: {file.filename}")
-    
-    if not file.content_type or not file.content_type.startswith('image/'):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File must be an image (jpg, png, etc.)"
-        )
-    
-    try:
-        # Save uploaded certificate temporarily
-        os.makedirs("uploads/certificates", exist_ok=True)
-        cert_id = str(uuid4())
-        temp_path = f"uploads/certificates/{cert_id}_{file.filename}"
-        
-        contents = await file.read()
-        with open(temp_path, "wb") as f:
-            f.write(contents)
-        
-        # Verify certificate
-        ocr_service = get_ocr_service()
-        result = await ocr_service.verify_certificate(
-            image_path=temp_path,
-            expected_name=expected_name,
-            resume_id=resume_id
-        )
-        
-        # Clean up temp file
-        try:
-            os.remove(temp_path)
-        except:
-            pass
-        
-        return result
-    
-    except Exception as e:
-        logger.exception(f"Certificate verification error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Certificate verification failed: {str(e)}"
-        )
-
-@app.post("/api/verify/deepfake", tags=["Verification"])
-async def analyze_deepfake(
-    request: DeepfakeAnalysisRequest
-):
-    """
-    AI-generated text detection
-    
-    Features:
-    - Perplexity scoring (GPT-2)
-    - Stylometric analysis
-    - N-gram repetition detection
-    - Burstiness analysis
-    - Generic phrase detection
-    """
-    logger.info("Deepfake analysis started")
-    
-    if not request.text or len(request.text) < 50:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Resume text too short for analysis (minimum 50 characters)"
-        )
-    
-    try:
-        deepfake_detector = get_deepfake_detector(use_perplexity=False)  # Disable perplexity for speed
-        result = await deepfake_detector.analyze_resume_text(request.text)
-        
-        return result
-    
-    except Exception as e:
-        logger.exception(f"Deepfake analysis error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Deepfake analysis failed: {str(e)}"
-        )
-
-@app.post("/api/verify/full", response_model=UnifiedVerificationResponse, tags=["Verification"])
-async def full_verification(
-    request: UnifiedVerificationRequest
-):
-    """
-    Unified verification endpoint - Complete resume authenticity check
-    
-    Integrates:
-    - GitHub analysis
-    - Certificate verification
-    - Deepfake detection
-    - LLM reasoning/explanation
-    - ML classification (if available)
-    
-    Returns comprehensive trust score and explanations
-    """
-    logger.info(f"Full verification started for resume: {request.resume_id}")
-    
-    # Check if resume exists
-    if request.resume_id not in mock_resumes:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Resume {request.resume_id} not found"
-        )
-    
-    resume = mock_resumes[request.resume_id]
-    
-    try:
-        # Read resume text
-        resume_text = ""
-        try:
-            with open(resume['file_path'], 'r', encoding='utf-8', errors='ignore') as f:
-                resume_text = f.read()
-        except:
-            pass
-        
-        # 1. GitHub verification (if username provided)
-        github_result = None
-        if request.github_username:
-            logger.info("Running GitHub verification...")
-            try:
-                github_service = get_github_service()
-                github_result = await github_service.verify_profile(
-                    username=request.github_username,
-                    claimed_skills=request.claimed_skills
-                )
-            except Exception as e:
-                logger.error(f"GitHub verification failed: {e}")
-        
-        # 2. Certificate verification (if images provided)
-        certificate_results = []
-        if request.certificate_image_paths:
-            logger.info("Running certificate verification...")
-            ocr_service = get_ocr_service()
-            for cert_path in request.certificate_image_paths:
-                try:
-                    cert_result = await ocr_service.verify_certificate(
-                        image_path=cert_path,
-                        resume_id=request.resume_id
-                    )
-                    certificate_results.append(cert_result)
-                except Exception as e:
-                    logger.error(f"Certificate verification failed: {e}")
-        
-        # 3. Deepfake detection
-        deepfake_result = None
-        if resume_text:
-            logger.info("Running deepfake detection...")
-            try:
-                deepfake_detector = get_deepfake_detector(use_perplexity=False)
-                deepfake_result = await deepfake_detector.analyze_resume_text(resume_text)
-            except Exception as e:
-                logger.error(f"Deepfake detection failed: {e}")
-        
-        # 4. LLM reasoning and explanation
-        llm_result = None
-        logger.info("Generating LLM explanation...")
-        try:
-            llm_service = get_llm_service(use_openai=False)  # Use template mode by default
-            
-            # Build resume data for LLM
-            resume_data = {
-                'name': resume.get('filename', 'Unknown'),
-                'experience_years': 3,  # Could be extracted
-                'skills': request.claimed_skills or [],
-                'education': [],
-                'employment': []
-            }
-            
-            llm_result = await llm_service.generate_verification_explanation(
-                resume_data=resume_data,
-                github_analysis=github_result,
-                certificate_analysis=certificate_results[0] if certificate_results else None,
-                deepfake_analysis=deepfake_result,
-                ml_prediction=None,
-                timeline_anomalies=[]
-            )
-        except Exception as e:
-            logger.error(f"LLM reasoning failed: {e}")
-        
-        # Build unified response
-        final_trust_score = llm_result.get('final_trust_score', 50.0) if llm_result else 50.0
-        risk_level = llm_result.get('risk_level', 'Medium') if llm_result else 'Medium'
-        
-        # Determine classification
-        if final_trust_score >= 75:
-            classification = "Verified"
-        elif final_trust_score >= 50:
-            classification = "Doubtful"
-        else:
-            classification = "Fake"
-        
-        return UnifiedVerificationResponse(
-            resume_id=request.resume_id,
-            final_trust_score=final_trust_score,
-            risk_level=risk_level,
-            classification=classification,
-            github_analysis=github_result,
-            certificate_analysis=certificate_results if certificate_results else None,
-            deepfake_analysis=deepfake_result,
-            llm_explanation=llm_result,
-            verified_at=datetime.utcnow()
-        )
-    
-    except Exception as e:
-        logger.exception(f"Full verification error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Verification failed: {str(e)}"
-        )
+# Verification endpoints have been moved to api/routes.py with rate limiting
+# The router is included at line 473: app.include_router(enterprise_router, prefix="/api")
 
 # Dashboard endpoints
 @app.get("/api/dashboard/stats", tags=["Dashboard"])
@@ -1092,16 +853,63 @@ async def http_exception_handler(request, exc):
     logger.error(f"HTTP error: {exc.status_code} - {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": exc.detail, "status_code": exc.status_code}
+        content={
+            "error": True,
+            "message": str(exc.detail),
+            "code": exc.status_code,
+        },
+    )
+
+
+@app.exception_handler(ResumeVerificationError)
+async def resume_verification_error_handler(request: Request, exc: ResumeVerificationError):
+    logger.exception("Resume verification error")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "message": exc.message,
+            "code": exc.status_code,
+        },
+    )
+
+
+@app.exception_handler(OCRProcessingError)
+async def ocr_processing_error_handler(request: Request, exc: OCRProcessingError):
+    logger.exception("OCR processing error")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "message": exc.message,
+            "code": exc.status_code,
+        },
+    )
+
+
+@app.exception_handler(BlockchainError)
+async def blockchain_error_handler(request: Request, exc: BlockchainError):
+    logger.exception("Blockchain error")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "message": exc.message,
+            "code": exc.status_code,
+        },
     )
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
+async def general_exception_handler(request: Request, exc):
     """Global exception handler"""
     logger.exception(f"Unhandled exception: {str(exc)}")
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "status_code": 500}
+        content={
+            "error": True,
+            "message": "Internal server error",
+            "code": 500,
+        },
     )
 
 # ===================== ENTRY POINT =====================

@@ -1,0 +1,126 @@
+services:
+  # PostgreSQL Database Service (Managed)
+  - type: pserv
+    name: resume-verify-db
+    env: postgresql
+    plan: free
+    region: oregon
+    ipAllowList: []  # Allow all internal connections
+    disk:
+      name: postgres-data
+      size: 10  # Free tier goes up to 5GB
+    envVars:
+      - key: POSTGRES_USER
+        value: postgres
+      - key: POSTGRES_PASSWORD
+        sync: false  # Set strong password in Render dashboard
+      - key: POSTGRES_DB
+        value: resume_verify
+
+  # Redis Cache Service (Managed)
+  - type: pserv
+    name: resume-verify-redis
+    env: redis
+    plan: free
+    region: oregon
+    disk:
+      name: redis-data
+      size: 5
+    ipAllowList: []
+
+  # Backend Service (FastAPI)
+  - type: web
+    name: resume-verify-backend
+    env: python
+    plan: free  # Upgrade to 'starter' to avoid cold boots
+    region: oregon
+    buildCommand: cd backend && pip install -r requirements.txt
+    startCommand: cd backend && gunicorn main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
+    autoDeploy: true
+    healthCheckPath: /api/health
+    headers:
+      - http:
+          domain: resume-verify-backend.onrender.com
+          path: /api/health
+          methods:
+            - GET
+          httpVersion: http10
+    envVars:
+      # Environment
+      - key: ENVIRONMENT
+        value: production
+
+      # Database Connection (linked from PostgreSQL service)
+      - key: DATABASE_URL
+        fromService:
+          type: pserv
+          name: resume-verify-db
+          property: connectionString
+        scope: RUN_AND_BUILD
+
+      # Redis Connection (linked from Redis service)
+      - key: REDIS_URL
+        fromService:
+          type: pserv
+          name: resume-verify-redis
+          property: connectionString
+        scope: RUN_AND_BUILD
+
+      # Frontend URL (linked from Frontend service)
+      - key: FRONTEND_URL
+        fromService:
+          type: web
+          name: resume-verify-frontend
+          property: url
+        scope: RUN_AND_BUILD
+
+      # Secrets (set in Render dashboard)
+      - key: JWT_SECRET
+        sync: false
+      - key: GITHUB_API_KEY
+        sync: false
+      - key: LINKEDIN_API_KEY
+        sync: false
+      - key: AWS_S3_BUCKET
+        sync: false
+      - key: AWS_REGION
+        value: us-east-1
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: ETH_RPC_URL
+        value: https://polygon-rpc.com
+      - key: SMART_CONTRACT_ADDRESS
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+
+      # Port
+      - key: PORT
+        value: "8000"
+
+  # Frontend Service (React + Vite)
+  - type: web
+    name: resume-verify-frontend
+    env: node
+    plan: free  # Upgrade to 'starter' to avoid cold boots
+    region: oregon
+    buildCommand: cd frontend && npm ci && npm run build
+    startCommand: cd frontend && npm run preview -- --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      # Backend URL (linked from Backend service)
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: resume-verify-backend
+          property: url
+        scope: BUILD
+
+      # Environment
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"

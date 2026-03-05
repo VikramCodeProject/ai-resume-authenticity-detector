@@ -46,6 +46,7 @@ services:
       REDIS_URL: redis://redis:6379
       JWT_SECRET: your-secret-key-change-in-production
       GITHUB_API_KEY: ${GITHUB_API_KEY}
+      RATE_LIMIT: 10/minute
       ENVIRONMENT: development
     ports:
       - "8000:8000"
@@ -74,7 +75,7 @@ services:
       - postgres
     volumes:
       - ./backend:/app
-    command: celery -A tasks worker --loglevel=info
+    command: celery -A workers.background_tasks.celery_app worker --loglevel=info
     networks:
       - resume_verify_network
 
@@ -92,6 +93,31 @@ services:
     volumes:
       - ./backend:/app
     command: celery -A tasks beat --loglevel=info
+    networks:
+      - resume_verify_network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: resume-verify-prometheus
+    volumes:
+      - ./backend/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+    networks:
+      - resume_verify_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: resume-verify-grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./backend/monitoring/grafana_dashboard.json:/etc/grafana/provisioning/dashboards/resume-dashboard.json
     networks:
       - resume_verify_network
 
@@ -113,6 +139,7 @@ services:
 
 volumes:
   postgres_data:
+  grafana_data:
 
 networks:
   resume_verify_network:

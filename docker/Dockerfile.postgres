@@ -1,0 +1,10 @@
+FROM postgres:15-alpine
+
+ENV POSTGRES_USER=postgres
+ENV POSTGRES_DB=resume_verify
+ENV POSTGRES_INITDB_ARGS=-c shared_buffers=256MB -c max_connections=200
+
+EXPOSE 5432
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
+    CMD pg_isready -U postgres -d resume_verify || exit 1
