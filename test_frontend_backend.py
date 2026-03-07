@@ -5,8 +5,11 @@ Tests full authentication and upload workflow
 """
 import requests
 import json
+import time
 
 API = "http://localhost:8000"
+TEST_EMAIL = f"test_{int(time.time())}@example.com"
+TEST_PASSWORD = "SecurePass123!"
 
 print("=" * 60)
 print("FRONTEND & BACKEND INTEGRATION TEST")
@@ -16,8 +19,10 @@ print("=" * 60)
 print("\n1. Testing User Registration...")
 try:
     res = requests.post(f"{API}/api/auth/register", json={
-        "email": "test@example.com",
-        "password": "password123"
+        "email": TEST_EMAIL,
+        "password": TEST_PASSWORD,
+        "full_name": "Frontend Backend Test",
+        "gdpr_consent": True
     })
     if res.status_code == 200:
         user = res.json()
@@ -34,8 +39,8 @@ print("\n2. Testing User Login...")
 token = None
 try:
     res = requests.post(f"{API}/api/auth/login", json={
-        "email": "test@example.com",
-        "password": "password123"
+        "email": TEST_EMAIL,
+        "password": TEST_PASSWORD
     })
     if res.status_code == 200:
         data = res.json()

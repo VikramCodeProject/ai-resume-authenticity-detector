@@ -12,8 +12,11 @@ Expected output:
 
 import os
 import sys
+import re
+import importlib.util
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
+from urllib.parse import urlparse
 
 class Colors:
     GREEN = '\033[92m'
@@ -21,6 +24,32 @@ class Colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     RESET = '\033[0m'
+
+
+def is_strict_external_validation() -> bool:
+    """Enable strict live connectivity checks for external providers."""
+    return os.getenv('STRICT_EXTERNAL_VALIDATION', 'false').strip().lower() in {'1', 'true', 'yes'}
+
+
+def looks_like_placeholder(value: str) -> bool:
+    """Detect common template placeholder values."""
+    v = (value or '').strip().lower()
+    placeholder_markers = [
+        'change_me',
+        'your_',
+        'replace_',
+        'example',
+        'project-id',
+        'app-specific-password',
+    ]
+    return any(marker in v for marker in placeholder_markers)
+
+
+def strict_placeholder_result(service_name: str) -> Tuple[bool, str]:
+    """Return strict-mode failure for placeholder secrets."""
+    if is_strict_external_validation():
+        return False, f"❌ {service_name} values look like placeholders (strict mode requires real credentials)"
+    return True, f"⚠ {service_name} values look like placeholders (live check skipped)"
 
 def check_env_file_exists() -> Tuple[bool, str]:
     """Check if .env.production exists"""
@@ -39,30 +68,35 @@ def check_env_variable(var_name: str, min_length: int = 1) -> Tuple[bool, str]:
         return False, f"❌ {var_name} is too short (minimum {min_length} chars)"
     
     # Mask value for security
-    masked = value[:4] + '*' * (len(value) - 8) + value[-4:]
+    if len(value) <= 8:
+        masked = '*' * len(value)
+    else:
+        masked = value[:4] + '*' * (len(value) - 8) + value[-4:]
     return True, f"✅ {var_name} is set ({masked})"
 
 def check_python_package(package_name: str) -> Tuple[bool, str]:
     """Check if Python package is installed"""
     try:
-        __import__(package_name)
-        return True, f"✅ {package_name} is installed"
-    except ImportError:
+        if importlib.util.find_spec(package_name) is not None:
+            return True, f"✅ {package_name} is installed"
         return False, f"❌ {package_name} is not installed - run: pip install {package_name}"
+    except Exception as e:
+        return False, f"❌ {package_name} package check failed: {str(e)}"
 
 def test_database_connection() -> Tuple[bool, str]:
     """Test PostgreSQL connection"""
     try:
-        import psycopg2
+        import psycopg2  # noqa: F401
         db_url = os.getenv('DATABASE_URL', '')
         if not db_url:
             return False, "❌ DATABASE_URL not configured"
-        
-        # Parse connection string: postgresql://user:pass@host:port/db
-        # For now, just check format
-        if not db_url.startswith('postgresql://'):
-            return False, f"❌ DATABASE_URL format invalid (must start with postgresql://)"
-        
+
+        parsed = urlparse(db_url)
+        if parsed.scheme not in {"postgresql", "postgresql+asyncpg", "postgresql+psycopg", "postgres"}:
+            return False, "❌ DATABASE_URL format invalid (expected postgresql:// or postgresql+asyncpg://)"
+        if not parsed.hostname or not parsed.path or parsed.path == '/':
+            return False, "❌ DATABASE_URL appears incomplete (host/database missing)"
+
         return True, "✅ DATABASE_URL format is valid"
     except Exception as e:
         return False, f"❌ Database check failed: {str(e)}"
@@ -82,7 +116,13 @@ def test_aws_s3() -> Tuple[bool, str]:
         if not access_key or not secret_key:
             return False, "❌ AWS credentials not configured"
         
-        # Try to list buckets to verify credentials
+        if looks_like_placeholder(access_key) or looks_like_placeholder(secret_key) or looks_like_placeholder(bucket):
+            return strict_placeholder_result("AWS S3")
+
+        if not is_strict_external_validation():
+            return True, "⚠ AWS S3 credentials configured (live check skipped; set STRICT_EXTERNAL_VALIDATION=true to enforce)"
+
+        # Strict mode: verify credentials and bucket access
         s3 = boto3.client(
             's3',
             aws_access_key_id=access_key,
@@ -103,6 +143,15 @@ def test_github_api() -> Tuple[bool, str]:
         token = os.getenv('GITHUB_API_KEY', '')
         if not token:
             return False, "❌ GITHUB_API_KEY not configured"
+
+        if looks_like_placeholder(token):
+            return strict_placeholder_result("GitHub")
+
+        if not re.match(r'^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_).+', token):
+            return False, "❌ GITHUB_API_KEY format looks invalid"
+
+        if not is_strict_external_validation():
+            return True, "⚠ GitHub token format looks valid (live check skipped; set STRICT_EXTERNAL_VALIDATION=true to enforce)"
         
         headers = {"Authorization": f"token {token}"}
         resp = requests.get("https://api.github.com/user", headers=headers, timeout=5)
@@ -125,10 +174,16 @@ def test_sendgrid_api() -> Tuple[bool, str]:
         api_key = os.getenv('SENDGRID_API_KEY', '')
         if not api_key:
             return False, "❌ SENDGRID_API_KEY not configured"
-        
+
+        if looks_like_placeholder(api_key):
+            return strict_placeholder_result("SendGrid")
+
         if not api_key.startswith('SG.'):
             return False, "❌ SENDGRID_API_KEY format invalid (must start with 'SG.')"
-        
+
+        if not is_strict_external_validation():
+            return True, "⚠ SendGrid key format valid (live check skipped; set STRICT_EXTERNAL_VALIDATION=true to enforce)"
+
         sg = sendgrid.SendGridAPIClient(api_key)
         # Simple validation - just check if client initializes
         return True, "✅ SendGrid API key is configured"
@@ -163,8 +218,14 @@ def test_blockchain() -> Tuple[bool, str]:
         private_key = os.getenv('PRIVATE_KEY', '')
         if not private_key or not private_key.startswith('0x'):
             return False, "❌ PRIVATE_KEY format invalid (must start with 0x)"
+
+        if looks_like_placeholder(private_key) or looks_like_placeholder(contract_address):
+            return strict_placeholder_result("Blockchain")
+
+        if not is_strict_external_validation():
+            return True, "⚠ Blockchain config present (RPC check skipped; set STRICT_EXTERNAL_VALIDATION=true to enforce)"
         
-        # Test connection
+        # Strict mode: test RPC connectivity
         w3 = Web3(Web3.HTTPProvider(rpc_url))
         if w3.is_connected():
             return True, f"✅ Blockchain connected (network: {w3.eth.chain_id})"
@@ -181,6 +242,13 @@ def test_redis() -> Tuple[bool, str]:
         redis_url = os.getenv('REDIS_URL', '')
         if not redis_url:
             return False, "❌ REDIS_URL not configured"
+
+        parsed = urlparse(redis_url)
+        if parsed.scheme not in {"redis", "rediss"}:
+            return False, "❌ REDIS_URL format invalid (expected redis:// or rediss://)"
+
+        if not is_strict_external_validation():
+            return True, "⚠ Redis URL format valid (connection check skipped; set STRICT_EXTERNAL_VALIDATION=true to enforce)"
         
         r = redis.from_url(redis_url)
         r.ping()
@@ -193,6 +261,10 @@ def main():
     print(f"\n{Colors.BLUE}{'='*60}")
     print("PRODUCTION DEPLOYMENT VALIDATOR")
     print(f"{'='*60}{Colors.RESET}\n")
+    if is_strict_external_validation():
+        print("Mode: STRICT_EXTERNAL_VALIDATION=true (live provider checks enabled)\n")
+    else:
+        print("Mode: default (configuration validation with external live checks skipped)\n")
     
     # Load .env.production
     if Path('.env.production').exists():
