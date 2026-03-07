@@ -11,8 +11,8 @@ services:
     env: python
     plan: free
     region: oregon
-    buildCommand: python -m pip install --upgrade pip && python -m pip install -r backend/requirements.render.txt
-    startCommand: cd backend && gunicorn main_render:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
+    buildCommand: python3 -m pip install --upgrade pip && python3 -m pip install -r backend/requirements.render.txt
+    startCommand: cd backend && python3 -m gunicorn main_render:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
     autoDeploy: true
     healthCheckPath: /api/health
     envVars:
