@@ -13,21 +13,36 @@ from datetime import datetime, timedelta
 import os
 from typing import Optional, List
 from pydantic import BaseModel, EmailStr
-import jwt
+import base64
+import hmac
 from functools import lru_cache
 from uuid import uuid4
 import shutil
 import random
 import hashlib
 
-# Optional argon2 (use passlib fallback if not available)
+# Optional JWT backend
+try:
+    import jwt
+    HAS_JWT = True
+except ImportError:
+    jwt = None
+    HAS_JWT = False
+
+# Optional password backends: argon2 -> passlib -> stdlib pbkdf2_hmac
+USE_ARGON2 = False
+USE_PASSLIB = False
+
 try:
     from argon2 import PasswordHasher as Argon2PasswordHasher
     from argon2.exceptions import VerifyMismatchError, InvalidHash
     USE_ARGON2 = True
 except ImportError:
-    from passlib.hash import pbkdf2_sha256
-    USE_ARGON2 = False
+    try:
+        from passlib.hash import pbkdf2_sha256
+        USE_PASSLIB = True
+    except ImportError:
+        pbkdf2_sha256 = None
 
 # Import verification services
 from services import (
@@ -36,7 +51,14 @@ from services import (
     get_llm_service,
     get_deepfake_detector
 )
-from api.routes import router as enterprise_router
+try:
+    from api.routes import router as enterprise_router
+    ENTERPRISE_ROUTER_ENABLED = True
+    ENTERPRISE_ROUTER_IMPORT_ERROR = ""
+except Exception as e:
+    enterprise_router = None
+    ENTERPRISE_ROUTER_ENABLED = False
+    ENTERPRISE_ROUTER_IMPORT_ERROR = str(e)
 
 # Optional monitoring (requires prometheus-client)
 try:
@@ -63,9 +85,16 @@ logger = logging.getLogger(__name__)
 if not MONITORING_ENABLED:
     logger.warning("Monitoring disabled (prometheus-client not installed)")
 if not USE_ARGON2:
-    logger.warning("Argon2 not available, using PBKDF2 for password hashing")
+    if USE_PASSLIB:
+        logger.warning("Argon2 not available, using Passlib PBKDF2 for password hashing")
+    else:
+        logger.warning("Argon2 and Passlib unavailable, using stdlib PBKDF2 fallback")
 if not RATE_LIMITING_ENABLED:
     logger.warning("Rate limiting disabled (slowapi not installed)")
+if not HAS_JWT:
+    logger.warning("PyJWT not installed - auth token generation/validation disabled")
+if not ENTERPRISE_ROUTER_ENABLED:
+    logger.warning("Enterprise router disabled: %s", ENTERPRISE_ROUTER_IMPORT_ERROR)
 
 # ===================== CONFIGURATION =====================
 
@@ -108,7 +137,7 @@ class Settings:
     def validate(self):
         """Validate critical settings"""
         if self.ENVIRONMENT == 'production':
-            if not self.JWT_SECRET or len(self.JWT_SECRET) < 32:
+            if HAS_JWT and (not self.JWT_SECRET or len(self.JWT_SECRET) < 32):
                 raise ValueError('JWT_SECRET must be set and at least 32 characters in production')
             if 'localhost' in self.ALLOWED_ORIGINS or '127.0.0.1' in self.ALLOWED_ORIGINS:
                 logger.warning('Localhost origins in production - review CORS settings')
@@ -218,6 +247,11 @@ class JWTService:
     
     def create_token(self, data: dict, expires_delta: Optional[timedelta] = None) -> str:
         """Create JWT token"""
+        if not HAS_JWT or jwt is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="JWT backend unavailable. Install PyJWT to enable authentication."
+            )
         to_encode = data.copy()
         if expires_delta:
             expire = datetime.utcnow() + expires_delta
@@ -230,6 +264,11 @@ class JWTService:
     
     def decode_token(self, token: str) -> dict:
         """Decode and validate JWT token"""
+        if not HAS_JWT or jwt is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="JWT backend unavailable. Install PyJWT to enable authentication."
+            )
         try:
             payload = jwt.decode(token, self.secret, algorithms=[self.algorithm])
             email: str = payload.get("sub")
@@ -239,15 +278,22 @@ class JWTService:
                     detail="Invalid token"
                 )
             return {"email": email, "user_id": payload.get("user_id")}
-        except jwt.ExpiredSignatureError:
+        except Exception as exc:
+            if HAS_JWT and isinstance(exc, jwt.ExpiredSignatureError):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token has expired"
+                )
+            if HAS_JWT and isinstance(exc, jwt.InvalidTokenError):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token"
+                )
+            if isinstance(exc, HTTPException):
+                raise exc
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has expired"
-            )
-        except jwt.InvalidTokenError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Token verification failed"
             )
 
 # ===================== SECURITY UTILITIES =====================
@@ -361,6 +407,35 @@ class AccountLockout:
         if email in self.failed_attempts:
             del self.failed_attempts[email]
 
+
+def _hash_password_stdlib(password: str) -> str:
+    """Password hash fallback using stdlib pbkdf2_hmac."""
+    salt = os.urandom(16)
+    iterations = 390000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return (
+        "pbkdf2_sha256$"
+        f"{iterations}$"
+        f"{base64.b64encode(salt).decode('utf-8')}$"
+        f"{base64.b64encode(digest).decode('utf-8')}"
+    )
+
+
+def _verify_password_stdlib(password_hash: str, password: str) -> bool:
+    """Verify stdlib pbkdf2_hmac hash."""
+    try:
+        scheme, iterations_str, salt_b64, digest_b64 = password_hash.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+
+        iterations = int(iterations_str)
+        salt = base64.b64decode(salt_b64.encode("utf-8"))
+        expected = base64.b64decode(digest_b64.encode("utf-8"))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
 class PasswordHasher:
     """Password hashing - uses Argon2 if available, otherwise PBKDF2"""
     
@@ -378,8 +453,9 @@ class PasswordHasher:
         """Hash password using available hasher"""
         if USE_ARGON2:
             return PasswordHasher._hasher.hash(password)
-        else:
+        if USE_PASSLIB and pbkdf2_sha256:
             return pbkdf2_sha256.hash(password)
+        return _hash_password_stdlib(password)
     
     @staticmethod
     def verify_password(password_hash: str, password: str) -> bool:
@@ -390,8 +466,9 @@ class PasswordHasher:
                 return True
             except (VerifyMismatchError, InvalidHash):
                 return False
-        else:
+        if USE_PASSLIB and pbkdf2_sha256:
             return pbkdf2_sha256.verify(password, password_hash)
+        return _verify_password_stdlib(password_hash, password)
 
 # ===================== DYNAMIC TRUST SCORE CALCULATION =====================
 
@@ -500,7 +577,7 @@ app.add_middleware(
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["localhost", "127.0.0.1"]
+    allowed_hosts=["localhost", "127.0.0.1", "resume-verify-backend.onrender.com", "*.onrender.com"]
 )
 
 # Add monitoring middleware if available
@@ -508,7 +585,8 @@ if MONITORING_ENABLED and metrics_middleware:
     app.middleware("http")(metrics_middleware)
     
 app.middleware("http")(request_logging_middleware)
-app.include_router(enterprise_router, prefix="/api")
+if ENTERPRISE_ROUTER_ENABLED and enterprise_router is not None:
+    app.include_router(enterprise_router, prefix="/api")
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -540,6 +618,10 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
             get_settings().JWT_ALGORITHM
         )
         return jwt_service.decode_token(token)
+    except HTTPException as e:
+        if get_settings().ENVIRONMENT == 'development':
+            return {"email": "test@example.com", "user_id": "test-user-123"}
+        raise e
     except Exception as e:
         if get_settings().ENVIRONMENT == 'development':
             return {"email": "test@example.com", "user_id": "test-user-123"}
