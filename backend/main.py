@@ -30,7 +30,17 @@ from services import (
     get_deepfake_detector
 )
 from api.routes import router as enterprise_router
-from monitoring.metrics import metrics_middleware, metrics_response
+
+# Optional monitoring (requires prometheus-client)
+try:
+    from monitoring.metrics import metrics_middleware, metrics_response
+    MONITORING_ENABLED = True
+except ImportError as e:
+    logger.warning(f"Monitoring disabled: {e}")
+    MONITORING_ENABLED = False
+    metrics_middleware = None
+    metrics_response = None
+
 from utils.exceptions import BlockchainError, OCRProcessingError, ResumeVerificationError
 from utils.logger import request_logging_middleware, setup_logging
 from utils.rate_limiter import SlowAPIMiddleware
@@ -468,13 +478,18 @@ app.add_middleware(
     allowed_hosts=["localhost", "127.0.0.1"]
 )
 
-app.middleware("http")(metrics_middleware)
+# Add monitoring middleware if available
+if MONITORING_ENABLED and metrics_middleware:
+    app.middleware("http")(metrics_middleware)
+    
 app.middleware("http")(request_logging_middleware)
 app.include_router(enterprise_router, prefix="/api")
 
 
 @app.get("/metrics", include_in_schema=False)
 async def metrics_endpoint():
+    if not MONITORING_ENABLED or not metrics_response:
+        raise HTTPException(status_code=503, detail="Metrics unavailable (prometheus-client not installed)")
     return metrics_response()
 
 # ===================== DEPENDENCY FUNCTIONS =====================
