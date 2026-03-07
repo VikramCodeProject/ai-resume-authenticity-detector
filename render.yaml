@@ -6,9 +6,6 @@ services:
     plan: free
     region: oregon
     ipAllowList: []  # Allow all internal connections
-    disk:
-      name: postgres-data
-      size: 10  # Free tier goes up to 5GB
     envVars:
       - key: POSTGRES_USER
         value: postgres
@@ -34,13 +31,6 @@ services:
     startCommand: cd backend && gunicorn main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
     autoDeploy: true
     healthCheckPath: /api/health
-    headers:
-      - http:
-          domain: resume-verify-backend.onrender.com
-          path: /api/health
-          methods:
-            - GET
-          httpVersion: http10
     envVars:
       # Environment
       - key: ENVIRONMENT
