@@ -11,7 +11,7 @@ services:
     env: python
     plan: free
     region: oregon
-    buildCommand: pip install -r backend/requirements.render.txt
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r backend/requirements.render.txt
     startCommand: cd backend && gunicorn main_render:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
     autoDeploy: true
     healthCheckPath: /api/health
@@ -20,7 +20,7 @@ services:
       - key: ENVIRONMENT
         value: production
       - key: BACKEND_MODE
-        value: minimal
+        value: full
 
       # Database Connection (set manually after creating PostgreSQL service)
       - key: DATABASE_URL
