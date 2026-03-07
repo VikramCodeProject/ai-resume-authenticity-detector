@@ -6,14 +6,31 @@ from typing import List, Optional
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile, Depends
 from pydantic import BaseModel
 
-from utils.rate_limiter import check_rate_limit
-from workers.background_tasks import (
-    get_task_status,
-    verify_certificate,
-    verify_full,
-    verify_github,
-    verify_resume_ai,
-)
+# Optional rate limiting
+try:
+    from utils.rate_limiter import check_rate_limit
+    RATE_LIMITING = True
+except ImportError:
+    RATE_LIMITING = False
+    async def check_rate_limit(request: Request):
+        pass  # No-op if rate limiting unavailable
+
+# Optional background tasks
+try:
+    from workers.background_tasks import (
+        get_task_status,
+        verify_certificate,
+        verify_full,
+        verify_github,
+        verify_resume_ai,
+    )
+    BACKGROUND_TASKS = True
+except ImportError:
+    BACKGROUND_TASKS = False
+    # Fallback stubs
+    def get_task_status(task_id: str):
+        raise HTTPException(503, "Background tasks unavailable (celery not installed)")
+    verify_certificate = verify_full = verify_github = verify_resume_ai = get_task_status
 
 logger = logging.getLogger("UsMiniProject")
 

@@ -5,11 +5,35 @@ Enterprise verification services for resume authenticity platform
 
 import logging
 
-from .github_service import GitHubVerificationService, get_github_service
-from .llm_reasoning import LLMReasoningService, get_llm_service
-from .blockchain_service import BlockchainVerificationService, get_blockchain_service
-
 logger = logging.getLogger(__name__)
+
+# Optional services - graceful degradation
+try:
+    from .github_service import GitHubVerificationService, get_github_service
+except Exception as exc:
+    logger.warning("GitHub service disabled: %s", exc)
+    class GitHubVerificationService:  # type: ignore[no-redef]
+        """Fallback placeholder"""
+    def get_github_service():  # type: ignore[no-redef]
+        raise RuntimeError("GitHub service unavailable")
+
+try:
+    from .llm_reasoning import LLMReasoningService, get_llm_service
+except Exception as exc:
+    logger.warning("LLM service disabled: %s", exc)
+    class LLMReasoningService:  # type: ignore[no-redef]
+        """Fallback placeholder"""
+    def get_llm_service():  # type: ignore[no-redef]
+        raise RuntimeError("LLM service unavailable")
+
+try:
+    from .blockchain_service import BlockchainVerificationService, get_blockchain_service
+except Exception as exc:
+    logger.warning("Blockchain service disabled: %s", exc)
+    class BlockchainVerificationService:  # type: ignore[no-redef]
+        """Fallback placeholder"""
+    def get_blockchain_service():  # type: ignore[no-redef]
+        raise RuntimeError("Blockchain service unavailable")
 
 try:
     from .ocr_service import CertificateOCRService, get_ocr_service

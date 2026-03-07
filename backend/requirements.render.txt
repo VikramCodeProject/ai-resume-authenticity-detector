@@ -19,6 +19,7 @@ redis==5.0.1
 PyJWT==2.8.0
 passlib==1.7.4
 
-# Utilities
+# HTTP clients
 python-dotenv==1.0.0
 requests==2.31.0
+aiohttp==3.9.1
