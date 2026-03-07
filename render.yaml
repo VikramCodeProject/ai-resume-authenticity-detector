@@ -5,7 +5,6 @@ services:
     env: postgresql
     plan: free
     region: oregon
-    ipAllowList: []  # Allow all internal connections
     envVars:
       - key: POSTGRES_USER
         value: postgres
@@ -14,18 +13,11 @@ services:
       - key: POSTGRES_DB
         value: resume_verify
 
-  # NOTE: Redis is not available in Render's free tier
-  # Use Upstash Redis (free tier) or Redis Cloud
-  # 1. Sign up at https://upstash.com
-  # 2. Create a Redis database
-  # 3. Copy the connection URL
-  # 4. Add it to REDIS_URL in Render dashboard
-
   # Backend Service (FastAPI)
   - type: web
     name: resume-verify-backend
     env: python
-    plan: free  # Upgrade to 'starter' to avoid cold boots
+    plan: free
     region: oregon
     buildCommand: cd backend && pip install -r requirements.txt
     startCommand: cd backend && gunicorn main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile -
@@ -36,40 +28,55 @@ services:
       - key: ENVIRONMENT
         value: production
 
-      # Database Connection (linked from PostgreSQL service)
+      # Database Connection - construct from host and port
       - key: DATABASE_URL
+        value: postgresql://postgres:${POSTGRES_PASSWORD}@${DATABASE_HOST}:${DATABASE_PORT}/resume_verify
+
+      # Database service properties
+      - key: DATABASE_HOST
         fromService:
           type: pserv
           name: resume-verify-db
-          property: connectionString
+          property: host
         scope: RUN_AND_BUILD
-
-      # Redis Connection (use external Redis service like Upstash)
-      - key: REDIS_URL
-        sync: false  # Set this to your Upstash Redis URL in Render dashboard
-
-      # Frontend URL (linked from Frontend service)
-      - key: FRONTEND_URL
+      - key: DATABASE_PORT
         fromService:
-          type: web
-          name: resume-verify-frontend
-          property: url
+          type: pserv
+          name: resume-verify-db
+          property: port
+        scope: RUN_AND_BUILD
+      - key: POSTGRES_PASSWORD
+        sync: false
+
+      # Redis Connection (use external service - Upstash)
+      - key: REDIS_URL
+        sync: false
+
+      # Frontend URL
+      - key: FRONTEND_URL
+        value: https://resume-verify-frontend.onrender.com
         scope: RUN_AND_BUILD
 
       # Secrets (set in Render dashboard)
       - key: JWT_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: ENCRYPTION_KEY
         sync: false
       - key: GITHUB_API_KEY
         sync: false
       - key: LINKEDIN_API_KEY
         sync: false
       - key: AWS_S3_BUCKET
-        sync: false
+        value: resume-verify-prod
       - key: AWS_REGION
         value: us-east-1
       - key: AWS_ACCESS_KEY_ID
         sync: false
       - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
         sync: false
       - key: ETH_RPC_URL
         value: https://polygon-rpc.com
@@ -86,19 +93,16 @@ services:
   - type: web
     name: resume-verify-frontend
     env: node
-    plan: free  # Upgrade to 'starter' to avoid cold boots
+    plan: free
     region: oregon
     buildCommand: cd frontend && npm ci && npm run build
     startCommand: cd frontend && npm run preview -- --host 0.0.0.0 --port $PORT
     autoDeploy: true
     healthCheckPath: /
     envVars:
-      # Backend URL (linked from Backend service)
+      # Backend API URL (hardcoded to backend service domain)
       - key: VITE_API_URL
-        fromService:
-          type: web
-          name: resume-verify-backend
-          property: url
+        value: https://resume-verify-backend.onrender.com
         scope: BUILD
 
       # Environment
