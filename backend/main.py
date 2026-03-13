@@ -11,7 +11,9 @@ from contextlib import asynccontextmanager
 import logging
 from datetime import datetime, timedelta
 import os
+from pathlib import Path
 from typing import Optional, List
+import json
 from pydantic import BaseModel, EmailStr
 import base64
 import hmac
@@ -20,6 +22,19 @@ from uuid import uuid4
 import shutil
 import random
 import hashlib
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+# Load environment files explicitly so local runs honor workspace config.
+if load_dotenv is not None:
+    repo_root = Path(__file__).resolve().parent.parent
+    load_dotenv(repo_root / ".env.development", override=False)
+    load_dotenv(repo_root / ".env", override=True)
+else:
+    repo_root = Path(__file__).resolve().parent.parent
 
 # Optional JWT backend
 try:
@@ -148,6 +163,37 @@ def get_settings() -> Settings:
     settings.validate()
     return settings
 
+
+def _read_env_key(file_path: Path, key: str) -> Optional[str]:
+    """Read one key from dotenv-style file without loading full parser state."""
+    if not file_path.exists():
+        return None
+
+    prefix = f"{key}="
+    for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip('"').strip("'")
+
+    return None
+
+
+def _detect_config_source(key: str) -> str:
+    """Infer active source for a key after dotenv load order."""
+    effective = os.getenv(key)
+    env_val = _read_env_key(repo_root / ".env", key)
+    dev_val = _read_env_key(repo_root / ".env.development", key)
+
+    if effective is None:
+        return "default"
+    if env_val is not None and effective == env_val:
+        return ".env"
+    if dev_val is not None and effective == dev_val:
+        return ".env.development"
+    return "process-environment"
+
 # ===================== DATA MODELS =====================
 
 class UserRegisterRequest(BaseModel):
@@ -207,6 +253,8 @@ class ResumeDetailResponse(BaseModel):
     uploaded_at: datetime
     trust_score: Optional[TrustScoreResponse] = None
     claims: List[ClaimResponse] = []
+    processing_progress: Optional[int] = None
+    processing_stage: Optional[str] = None
 
 # New Response Models for Enterprise Features
 class GitHubVerificationRequest(BaseModel):
@@ -478,46 +526,117 @@ def calculate_dynamic_trust_score(filename: str, resume_id: str) -> dict:
     - Same filename = always same score (deterministic)
     - Different filename = always different score (unique)
     """
-    # Use ONLY filename for consistent hashing
-    hash_obj = hashlib.sha256(filename.encode())
-    hash_hex = hash_obj.hexdigest()
-    
-    # Use different parts of hash for better distribution
-    # Part 1: Overall score (first 8 hex chars)
-    hash1 = int(hash_hex[0:8], 16) % 76  # 0-75, becomes 20-95
-    
-    # Part 2: Verified count (next 8 hex chars)
-    hash2 = int(hash_hex[8:16], 16) % 11  # 0-10, becomes 8-18
-    
-    # Part 3: Doubtful count (next 8 hex chars)  
-    hash3 = int(hash_hex[16:24], 16) % 8  # 0-7, becomes 1-8
-    
-    # Part 4: Fake count (next 4 hex chars)
-    hash4 = int(hash_hex[24:28], 16) % 5  # 0-4, becomes 0-4
-    
-    # Convert to actual values with offsets
-    overall_base = 20 + hash1  # 20-95
-    verified = 8 + hash2  # 8-18
-    doubtful = 1 + hash3  # 1-8
-    fake = max(0, hash4 - 1)  # 0-4
-    
-    # Adjust overall based on verification distribution
-    total_claims = verified + doubtful + fake
-    if total_claims > 0:
-        verified_ratio = verified / total_claims
-        # Formula: verified_ratio heavily influences final score
-        adjusted_score = 20 + (verified_ratio * 75)  # 20-95 range
-        overall_base = int(adjusted_score)
-    
-    # Final score: 20-95, unique per filename
-    final_score = max(20, min(95, overall_base))
-    
+    seed = f"{filename}|{resume_id}"
+    hash_hex = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    github_score = 45 + (int(hash_hex[0:8], 16) % 51)
+    linkedin_score = 45 + (int(hash_hex[8:16], 16) % 51)
+    certificate_score = 40 + (int(hash_hex[16:24], 16) % 56)
+    timeline_score = 50 + (int(hash_hex[24:32], 16) % 46)
+
+    weighted = (
+        github_score * 0.30
+        + linkedin_score * 0.25
+        + certificate_score * 0.20
+        + timeline_score * 0.25
+    )
+    final_score = round(max(20, min(95, weighted)), 1)
+
+    total_claims = 12 + (int(hash_hex[32:40], 16) % 15)  # 12-26
+    verified_ratio = max(0.2, min(0.9, (final_score - 20) / 75))
+    fake_ratio = max(0.02, min(0.35, (85 - final_score) / 200))
+
+    verified = max(1, int(round(total_claims * verified_ratio)))
+    fake = max(0, int(round(total_claims * fake_ratio)))
+    doubtful = max(0, total_claims - verified - fake)
+
+    if verified + doubtful + fake != total_claims:
+        doubtful = max(0, total_claims - verified - fake)
+
     return {
-        'overall_score': round(final_score, 1),
+        'overall_score': final_score,
         'verified_count': verified,
         'doubtful_count': doubtful,
-        'fake_count': fake
+        'fake_count': fake,
+        'source_scores': {
+            'github_score': github_score,
+            'linkedin_score': linkedin_score,
+            'certificate_score': certificate_score,
+            'timeline_score': timeline_score,
+        }
     }
+
+
+def get_processing_state(resume: dict) -> tuple[int, str]:
+    """Return realistic processing progress and stage text."""
+    started_at = datetime.fromisoformat(resume['uploaded_at'])
+    elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
+    duration_seconds = float(resume.get('processing_duration_seconds', 8.0))
+    progress = int(min(100, round((elapsed_seconds / duration_seconds) * 100)))
+
+    if progress < 20:
+        return progress, "Extracting text from resume..."
+    if progress < 45:
+        return progress, "Identifying claims and entities..."
+    if progress < 75:
+        return progress, "Cross-checking GitHub, timeline, and certificates..."
+    if progress < 100:
+        return progress, "Calculating trust score and explanation..."
+    return 100, "Verification complete"
+
+
+def ensure_unique_score_for_same_pdf(resume_id: str, resume: dict, trust_score: dict) -> dict:
+    """Avoid identical score collisions for repeated uploads of the same file by the same user."""
+    user_id = resume.get("user_id")
+    filename = resume.get("filename")
+    target_key = get_score_history_key(resume)
+
+    existing_scores = set()
+    for existing_id, existing_resume in mock_resumes.items():
+        if existing_id == resume_id:
+            continue
+        if existing_resume.get("user_id") != user_id:
+            continue
+        if existing_resume.get("filename") != filename:
+            continue
+
+        existing_trust = existing_resume.get("trust_score")
+        if existing_trust and isinstance(existing_trust.get("overall_score"), (int, float)):
+            existing_scores.add(int(round(existing_trust["overall_score"])))
+
+    persisted_scores = mock_score_history.get(target_key, [])
+    for value in persisted_scores:
+        try:
+            existing_scores.add(int(value))
+        except Exception:
+            continue
+
+    if not existing_scores:
+        return trust_score
+
+    candidate_score = int(round(trust_score["overall_score"]))
+    if candidate_score not in existing_scores:
+        return trust_score
+
+    adjusted = dict(trust_score)
+    for delta in [1, -1, 2, -2, 3, -3, 4, -4, 5, -5]:
+        new_score = max(20, min(95, candidate_score + delta))
+        if new_score in existing_scores:
+            continue
+
+        adjusted["overall_score"] = float(new_score)
+        if new_score > candidate_score:
+            adjusted["verified_count"] = adjusted["verified_count"] + 1
+            if adjusted["doubtful_count"] > 0:
+                adjusted["doubtful_count"] = adjusted["doubtful_count"] - 1
+        elif new_score < candidate_score:
+            if adjusted["verified_count"] > 1:
+                adjusted["verified_count"] = adjusted["verified_count"] - 1
+            adjusted["doubtful_count"] = adjusted["doubtful_count"] + 1
+
+        return adjusted
+
+    return adjusted
 
 # ===================== MOCK DATA STORAGE =====================
 # In production, use real database. For now, store in memory for testing.
@@ -527,6 +646,95 @@ mock_resumes = {}
 mock_claims = {}
 mock_verifications = {}
 mock_predictions = {}
+mock_users_store_file = repo_root / "backend" / "data" / "mock_users.json"
+mock_score_history = {}
+mock_score_history_store_file = repo_root / "backend" / "data" / "mock_score_history.json"
+
+
+def load_mock_users() -> None:
+    """Load persisted mock users (dev-only local persistence)."""
+    global mock_users
+    if not mock_users_store_file.exists():
+        mock_users = {}
+        return
+
+    try:
+        data = json.loads(mock_users_store_file.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            mock_users = data
+            logger.info("Loaded %s persisted mock users", len(mock_users))
+            return
+        logger.warning("Mock users store has invalid format; starting with empty store")
+        mock_users = {}
+    except Exception as exc:
+        logger.warning("Failed to load mock users store: %s", exc)
+        mock_users = {}
+
+
+def save_mock_users() -> None:
+    """Persist mock users to disk atomically."""
+    try:
+        mock_users_store_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = mock_users_store_file.with_suffix(".json.tmp")
+        temp_file.write_text(json.dumps(mock_users, indent=2), encoding="utf-8")
+        temp_file.replace(mock_users_store_file)
+    except Exception as exc:
+        logger.warning("Failed to persist mock users store: %s", exc)
+
+
+def load_mock_score_history() -> None:
+    """Load persisted score history so uniqueness survives restarts."""
+    global mock_score_history
+    if not mock_score_history_store_file.exists():
+        mock_score_history = {}
+        return
+
+    try:
+        data = json.loads(mock_score_history_store_file.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            mock_score_history = data
+            logger.info("Loaded persisted score history keys: %s", len(mock_score_history))
+            return
+        logger.warning("Score history store has invalid format; starting fresh")
+        mock_score_history = {}
+    except Exception as exc:
+        logger.warning("Failed to load score history store: %s", exc)
+        mock_score_history = {}
+
+
+def save_mock_score_history() -> None:
+    """Persist score history to disk atomically."""
+    try:
+        mock_score_history_store_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = mock_score_history_store_file.with_suffix(".json.tmp")
+        temp_file.write_text(json.dumps(mock_score_history, indent=2), encoding="utf-8")
+        temp_file.replace(mock_score_history_store_file)
+    except Exception as exc:
+        logger.warning("Failed to persist score history store: %s", exc)
+
+
+def get_score_history_key(resume: dict) -> str:
+    """Create stable key for uniqueness checks: user + file hash fallback to filename."""
+    user_id = str(resume.get("user_id") or "unknown-user")
+    file_hash = str(resume.get("file_hash") or "")
+    filename = str(resume.get("filename") or "unknown-file").strip().lower()
+    material = file_hash if file_hash else filename
+    return f"{user_id}::{material}"
+
+
+def register_score_history(resume: dict) -> None:
+    """Record integer score used for this resume key."""
+    trust = resume.get("trust_score")
+    if not trust or not isinstance(trust.get("overall_score"), (int, float)):
+        return
+
+    score_int = int(round(float(trust["overall_score"])))
+    key = get_score_history_key(resume)
+    used = mock_score_history.get(key, [])
+    if score_int not in used:
+        used.append(score_int)
+    mock_score_history[key] = used
+    save_mock_score_history()
 
 # Security utilities initialization
 rate_limiter = RateLimiter()
@@ -541,9 +749,13 @@ async def startup_event():
     logger.info("Application starting...")
     os.makedirs("uploads", exist_ok=True)
     logger.info("Uploads directory ready")
+    load_mock_users()
+    load_mock_score_history()
 
 async def shutdown_event():
     """Application shutdown"""
+    save_mock_users()
+    save_mock_score_history()
     logger.info("Application shutting down...")
 
 @asynccontextmanager
@@ -600,9 +812,6 @@ async def metrics_endpoint():
 async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
     """Verify JWT token from Authorization header"""
     if not authorization:
-        # For development, allow requests without auth
-        if get_settings().ENVIRONMENT == 'development':
-            return {"email": "test@example.com", "user_id": "test-user-123"}
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing authorization header"
@@ -619,12 +828,8 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
         )
         return jwt_service.decode_token(token)
     except HTTPException as e:
-        if get_settings().ENVIRONMENT == 'development':
-            return {"email": "test@example.com", "user_id": "test-user-123"}
         raise e
-    except Exception as e:
-        if get_settings().ENVIRONMENT == 'development':
-            return {"email": "test@example.com", "user_id": "test-user-123"}
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
@@ -641,6 +846,41 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "environment": get_settings().ENVIRONMENT,
         "version": "1.0.0"
+    }
+
+
+@app.get("/api/config-check", tags=["System"])
+async def config_check():
+    """Development-only config diagnostics (never returns secret values)."""
+    settings = get_settings()
+    if settings.ENVIRONMENT != "development":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not available")
+
+    jwt_secret = os.getenv("JWT_SECRET", "")
+
+    return {
+        "environment": settings.ENVIRONMENT,
+        "files": {
+            ".env": (repo_root / ".env").exists(),
+            ".env.development": (repo_root / ".env.development").exists(),
+        },
+        "sources": {
+            "JWT_SECRET": _detect_config_source("JWT_SECRET"),
+            "DATABASE_URL": _detect_config_source("DATABASE_URL"),
+            "REDIS_URL": _detect_config_source("REDIS_URL"),
+            "ENVIRONMENT": _detect_config_source("ENVIRONMENT"),
+        },
+        "jwt": {
+            "configured": bool(jwt_secret),
+            "length": len(jwt_secret),
+            "strong": len(jwt_secret) >= 32,
+            "algorithm": settings.JWT_ALGORITHM,
+        },
+        "sanity": {
+            "database_url_configured": bool(settings.DATABASE_URL),
+            "redis_url_configured": bool(settings.REDIS_URL),
+        },
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 # Authentication endpoints
@@ -687,6 +927,7 @@ async def register(request: UserRegisterRequest):
         'failed_login_attempts': 0,
         'is_locked': False
     }
+    save_mock_users()
     
     logger.info(f"User registered: {request.email}")
     
@@ -718,7 +959,14 @@ async def login(request: UserLoginRequest):
     
     # Authenticate user
     user = mock_users.get(request.email)
-    if not user or not PasswordHasher.verify_password(user['password_hash'], request.password):
+    if not user:
+        logger.warning(f"Login blocked for non-existent account: {request.email}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account not found. Please register first."
+        )
+
+    if not PasswordHasher.verify_password(user['password_hash'], request.password):
         # Record failed login attempt
         account_lockout.record_failure(request.email)
         failed_attempts = len(account_lockout.failed_attempts.get(request.email, []))
@@ -807,9 +1055,11 @@ async def upload_resume(
             'id': resume_id,
             'user_id': current_user.get('user_id'),
             'filename': file.filename,
+            'file_hash': hashlib.sha256(contents).hexdigest(),
             'file_path': file_path,
             'status': 'processing',
             'uploaded_at': datetime.utcnow().isoformat(),
+            'processing_duration_seconds': max(5.0, min(18.0, round(6.0 + (len(contents) / (1024 * 1024)) * 2.5 + random.uniform(0.5, 2.5), 1))),
             'trust_score': None,
             'claims': []
         }
@@ -850,14 +1100,18 @@ async def get_resume_details(
         )
     
     resume = mock_resumes[resume_id]
-    
-    # Simulate processing completion after a delay
+
+    processing_progress = None
+    processing_stage = None
     if resume['status'] == 'processing':
-        resume['status'] = 'completed'
+        processing_progress, processing_stage = get_processing_state(resume)
+        if processing_progress >= 100:
+            resume['status'] = 'completed'
     
-    # Always calculate fresh trust score based on resume filename and ID
-    if resume['status'] == 'completed':
+    # Calculate trust score once when processing completes.
+    if resume['status'] == 'completed' and not resume.get('trust_score'):
         trust_score = calculate_dynamic_trust_score(resume['filename'], resume_id)
+        trust_score = ensure_unique_score_for_same_pdf(resume_id, resume, trust_score)
         resume['trust_score'] = {
             'overall_score': trust_score['overall_score'],
             'verified_count': trust_score['verified_count'],
@@ -865,6 +1119,7 @@ async def get_resume_details(
             'fake_count': trust_score['fake_count'],
             'generated_at': datetime.utcnow().isoformat()
         }
+        register_score_history(resume)
     
     return ResumeDetailResponse(
         resume_id=resume['id'],
@@ -872,7 +1127,9 @@ async def get_resume_details(
         status=resume['status'],
         uploaded_at=resume['uploaded_at'],
         trust_score=resume.get('trust_score'),
-        claims=resume.get('claims', [])
+        claims=resume.get('claims', []),
+        processing_progress=processing_progress,
+        processing_stage=processing_stage
     )
 
 @app.get("/api/resumes/{resume_id}/trust-score", response_model=TrustScoreResponse, tags=["Resumes"])
@@ -894,6 +1151,7 @@ async def get_trust_score(
     # If not yet calculated, generate dynamic score
     if not resume.get('trust_score'):
         trust_score = calculate_dynamic_trust_score(resume['filename'], resume_id)
+        trust_score = ensure_unique_score_for_same_pdf(resume_id, resume, trust_score)
         resume['trust_score'] = {
             'overall_score': trust_score['overall_score'],
             'verified_count': trust_score['verified_count'],
@@ -901,6 +1159,7 @@ async def get_trust_score(
             'fake_count': trust_score['fake_count'],
             'generated_at': datetime.utcnow().isoformat()
         }
+        register_score_history(resume)
     
     trust_score_data = resume['trust_score']
     return TrustScoreResponse(

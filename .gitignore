@@ -56,6 +56,8 @@ logs/
 # Uploads & User Data
 uploads/*
 !uploads/.gitkeep
+backend/data/*.json
+!backend/data/.gitkeep
 backups/
 *.pdf
 *.docx

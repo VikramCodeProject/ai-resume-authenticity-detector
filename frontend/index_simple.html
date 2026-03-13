@@ -390,6 +390,7 @@
         <div id="loginMode">
           <h2>Resume Verify</h2>
           <p>Enterprise AI-powered verification system</p>
+          <p style="margin-top:-8px;font-size:12px;color:var(--accent-orange)">Only registered emails can sign in. If your email is new, create an account first.</p>
           
           <input id="loginEmail" type="email" placeholder="Email address">
           <input id="loginPassword" type="password" placeholder="Password">
@@ -418,7 +419,7 @@
           
           <input id="registerFullName" type="text" placeholder="Full name">
           <input id="registerEmail" type="email" placeholder="Email address">
-          <input id="registerPassword" type="password" placeholder="Password (min 6 chars)">
+          <input id="registerPassword" type="password" placeholder="Password (8+ chars, upper/lower/number/symbol)">
           <input id="registerConfirm" type="password" placeholder="Confirm password">
           
           <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
@@ -618,6 +619,7 @@
       let backendHealthTimer = null;
       let backendHealthConsecutiveFailures = 0;
       let backendHealthInFlight = false;
+      let centerTruthScore = '—';
 
       function saveBackendHealthSnapshot(snapshot) {
         try {
@@ -646,7 +648,7 @@
       async function parseApiError(res) {
         try {
           const data = await res.json();
-          if (data?.error) return data.error;
+          if (data?.error && data?.message) return data.message;
           if (data?.detail) {
             if (Array.isArray(data.detail)) {
               return data.detail.map(d => d.msg).filter(Boolean).join(', ') || 'Request failed';
@@ -913,8 +915,12 @@
           return;
         }
         
-        if(password.length < 6) {
-          errorEl.textContent = '✗ Password must be at least 6 characters';
+        if(password.length < 8 ||
+          !/[A-Z]/.test(password) ||
+          !/[a-z]/.test(password) ||
+          !/[0-9]/.test(password) ||
+          !/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
+          errorEl.textContent = '✗ Password must have 8+ chars with upper/lower letters, number, and symbol';
           errorEl.style.display = 'block';
           return;
         }
@@ -1057,7 +1063,7 @@
       function parseXhrError(xhr) {
         try {
           const data = JSON.parse(xhr.responseText || '{}');
-          if (data?.error) return data.error;
+          if (data?.error && data?.message) return data.message;
           if (data?.detail) {
             if (Array.isArray(data.detail)) {
               return data.detail.map((d) => d.msg).filter(Boolean).join(', ') || 'Request failed';
@@ -1215,6 +1221,18 @@
             const data = await res.json();
             console.log('Verification response:', data);
 
+            if (data.status === 'processing') {
+              const apiProgress = Number.isFinite(data.processing_progress)
+                ? data.processing_progress
+                : currentAttempt * 5;
+              const boundedApiProgress = Math.max(0, Math.min(100, Math.round(apiProgress)));
+              const visualProgress = Math.min(97, 70 + Math.round(boundedApiProgress * 0.27));
+              const stageText = data.processing_stage || 'Analyzing resume claims...';
+              setProgress(visualProgress, `${stageText} (${boundedApiProgress}%)`);
+              await delay(900);
+              continue;
+            }
+
             if(data.trust_score) {
               displayScore(data.trust_score);
               setProgress(100, 'Verification complete');
@@ -1264,6 +1282,7 @@
 
       function displayScore(score) {
         const finalScore = Math.round(score.overall_score);
+        centerTruthScore = String(finalScore);
         
         const trustScoreEl = document.getElementById('trustScore');
         if (trustScoreEl) {
@@ -1288,8 +1307,12 @@
         
         allScores.push(finalScore);
         
+        const verifiedStrength = Math.max(0, Math.min(100, Math.round(55 + score.verified_count * 2.8 - score.fake_count * 4.5)));
+        const doubtfulRisk = Math.max(0, Math.min(100, Math.round(score.doubtful_count * 11 + Math.max(0, 75 - finalScore) * 0.35)));
+        const fakeRisk = Math.max(0, Math.min(100, Math.round(score.fake_count * 18 + Math.max(0, 65 - finalScore) * 0.6)));
+
         setPieData([finalScore, 100 - finalScore]);
-        setBarData([finalScore, score.verified_count * 5, score.doubtful_count * 5, score.fake_count * 10]);
+        setBarData([finalScore, verifiedStrength, doubtfulRisk, fakeRisk]);
       }
 
       cancelUploadBtn.addEventListener('click', () => {
@@ -1304,10 +1327,13 @@
       });
 
       clearBtn.addEventListener('click', () => {
+        centerTruthScore = '—';
         document.getElementById('largeScore').innerText = '—';
         document.getElementById('verCount').innerText = '0';
         document.getElementById('dbtCount').innerText = '0';
         document.getElementById('fkCount').innerText = '0';
+        setPieData([0, 100]);
+        setBarData([0, 0, 0, 0]);
         fileInput.value = '';
         currentFile = null;
         if (isUploadInProgress) {
@@ -1341,6 +1367,29 @@
       });
 
       // Charts
+      const doughnutCenterTextPlugin = {
+        id: 'doughnutCenterTextPlugin',
+        afterDatasetsDraw(chart) {
+          const { ctx } = chart;
+          const firstArc = chart.getDatasetMeta(0).data[0];
+          if (!firstArc) return;
+
+          const centerX = firstArc.x;
+          const centerY = firstArc.y;
+
+          ctx.save();
+          ctx.textAlign = 'center';
+          ctx.fillStyle = 'rgba(255,255,255,0.95)';
+          ctx.font = '700 30px Poppins, Inter, sans-serif';
+          ctx.fillText(centerTruthScore, centerX, centerY + 8);
+
+          ctx.fillStyle = 'rgba(255,255,255,0.6)';
+          ctx.font = '600 11px Inter, sans-serif';
+          ctx.fillText('Truth Score', centerX, centerY + 26);
+          ctx.restore();
+        }
+      };
+
       const pieCtx = document.getElementById('pieChart').getContext('2d');
       const pieChart = new Chart(pieCtx, {
         type: 'doughnut',
@@ -1366,7 +1415,8 @@
           }, 
           responsive: true, 
           maintainAspectRatio: false 
-        }
+        },
+        plugins: [doughnutCenterTextPlugin]
       });
 
       const barCtx = document.getElementById('barChart').getContext('2d');
@@ -1417,6 +1467,13 @@
           const res = await fetch(`${API}/api/dashboard/stats`, {
             headers: { 'Authorization': `Bearer ${currentToken}` }
           });
+          if (res.status === 401) {
+            currentToken = null;
+            localStorage.removeItem('authToken');
+            updateAuthUI();
+            showToast('Session expired. Please sign in again.', true);
+            return null;
+          }
           if (!res.ok) throw new Error('Stats fetch failed');
           return await res.json();
         } catch (err) {
@@ -1431,6 +1488,13 @@
           const res = await fetch(`${API}/api/resumes`, {
             headers: { 'Authorization': `Bearer ${currentToken}` }
           });
+          if (res.status === 401) {
+            currentToken = null;
+            localStorage.removeItem('authToken');
+            updateAuthUI();
+            showToast('Session expired. Please sign in again.', true);
+            return [];
+          }
           if (!res.ok) throw new Error('Resumes fetch failed');
           const data = await res.json();
           return Array.isArray(data.resumes) ? data.resumes : [];
