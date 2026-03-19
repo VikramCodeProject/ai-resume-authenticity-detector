@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 import hashlib
 import json
+from difflib import SequenceMatcher
 
 # Image processing
 from PIL import Image
@@ -44,6 +45,8 @@ import spacy
 from dateutil import parser as date_parser
 
 logger = logging.getLogger(__name__)
+
+_SEEN_IMAGE_HASHES: set[str] = set()
 
 
 class CertificateOCRService:
@@ -119,6 +122,8 @@ class CertificateOCRService:
             
             # 2. Extract text with OCR
             extracted_text = self._extract_text_ocr(preprocessed_image)
+
+            image_sha256 = self._compute_image_hash(image_path)
             
             if not extracted_text or len(extracted_text) < 10:
                 return self._error_response("Failed to extract meaningful text from certificate")
@@ -128,9 +133,18 @@ class CertificateOCRService:
             
             # 4. Validate certificate
             validation_results = self._validate_certificate(entities, extracted_text)
+            if expected_name:
+                validation_results["name_match_score"] = self._name_match_score(
+                    expected_name,
+                    entities.get("name"),
+                    extracted_text,
+                )
             
             # 5. Check for duplicates
             duplicate_check = await self._check_duplicate(entities, resume_id)
+            duplicate_check["image_hash"] = image_sha256
+            duplicate_check["seen_image_hash"] = image_sha256 in _SEEN_IMAGE_HASHES
+            _SEEN_IMAGE_HASHES.add(image_sha256)
             
             # 6. Detect tampering
             tamper_score = self._detect_tampering(image_path, extracted_text)
@@ -255,6 +269,21 @@ class CertificateOCRService:
         
         logger.debug(f"Extracted text: {text[:100]}...")
         return text
+
+    def _compute_image_hash(self, image_path: str) -> str:
+        path = Path(image_path)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _name_match_score(self, expected_name: str, extracted_name: Optional[str], full_text: str) -> float:
+        expected = (expected_name or "").strip().lower()
+        if not expected:
+            return 0.0
+
+        candidates = []
+        if extracted_name:
+            candidates.append(extracted_name.lower())
+        candidates.append(full_text.lower())
+        return max(SequenceMatcher(None, expected, c).ratio() for c in candidates)
     
     def _clean_text(self, text: str) -> str:
         """Clean extracted text"""
@@ -544,6 +573,8 @@ class CertificateOCRService:
         # Deduct points for missing/invalid data
         if not validation_results.get('has_name'):
             score -= 20
+        if validation_results.get('name_match_score', 1.0) < 0.6:
+            score -= 20
         if not validation_results.get('has_issuer'):
             score -= 15
         if not validation_results.get('trusted_issuer'):
@@ -558,6 +589,8 @@ class CertificateOCRService:
         # Deduct for duplicates
         if duplicate_check.get('is_duplicate'):
             score -= 30
+        if duplicate_check.get('seen_image_hash'):
+            score -= 15
         
         # Deduct for tampering
         tamper_score_value = tamper_score.get('suspicious_score', 0)

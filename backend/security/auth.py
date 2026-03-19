@@ -86,10 +86,21 @@ class JWTManager:
             access_token_expire_minutes: Access token TTL
             refresh_token_expire_days: Refresh token TTL
         """
-        self.secret_key = secret_key or os.getenv("JWT_SECRET", "dev-secret-key-change-in-production")
+        self.secret_key = secret_key or os.getenv("JWT_SECRET", "")
         self.algorithm = algorithm
         self.access_token_expire = timedelta(minutes=access_token_expire_minutes)
         self.refresh_token_expire = timedelta(days=refresh_token_expire_days)
+        self._revoked_jtis: set[str] = set()
+        self._allow_insecure_dev_secret = os.getenv("ALLOW_INSECURE_DEV_JWT", "false").lower() == "true"
+
+        if not self.secret_key:
+            if os.getenv("ENVIRONMENT", "development") == "production":
+                raise ValueError("JWT_SECRET must be configured in production")
+            if self._allow_insecure_dev_secret:
+                self.secret_key = "unsafe-local-development-secret"
+                logger.warning("Using insecure development JWT secret")
+            else:
+                raise ValueError("JWT_SECRET is required. Set ALLOW_INSECURE_DEV_JWT=true only for local development")
         
         # Validate secret in production
         if os.getenv("ENVIRONMENT") == "production" and len(self.secret_key) < 32:
@@ -229,6 +240,8 @@ class JWTManager:
             )
             
             token_data = TokenPayload(**payload)
+            if token_data.jti in self._revoked_jtis:
+                raise InvalidTokenError("Token has been revoked")
             logger.debug(f"Token verified for user {token_data.sub}")
             return token_data
             
@@ -272,8 +285,7 @@ class JWTManager:
         Args:
             jti: JWT ID to revoke
         """
-        # In production, store in Redis with TTL
-        # redis.setex(f"revoked:{jti}", token_expiry_seconds, "true")
+        self._revoked_jtis.add(jti)
         logger.info(f"Token {jti} marked for revocation")
     
     @staticmethod

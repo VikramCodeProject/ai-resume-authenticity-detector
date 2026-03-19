@@ -86,6 +86,14 @@ except ImportError as e:
 
 from utils.exceptions import BlockchainError, OCRProcessingError, ResumeVerificationError
 from utils.logger import request_logging_middleware, setup_logging
+from utils.api_response import success_response, error_response
+from security.http_security import attach_security_headers, issue_csrf_cookie, validate_csrf
+
+try:
+    from security.auth import UserRole, get_jwt_manager
+except Exception:
+    UserRole = None
+    get_jwt_manager = None
 
 # Optional rate limiting
 try:
@@ -201,6 +209,7 @@ class UserRegisterRequest(BaseModel):
     password: str
     full_name: str
     gdpr_consent: bool
+    role: Optional[str] = "candidate"
 
 class UserLoginRequest(BaseModel):
     email: EmailStr
@@ -325,7 +334,12 @@ class JWTService:
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid token"
                 )
-            return {"email": email, "user_id": payload.get("user_id")}
+            return {
+                "email": email,
+                "user_id": payload.get("user_id"),
+                "role": payload.get("role", "candidate"),
+                "token_type": payload.get("token_type", "access"),
+            }
         except Exception as exc:
             if HAS_JWT and isinstance(exc, jwt.ExpiredSignatureError):
                 raise HTTPException(
@@ -801,6 +815,23 @@ if ENTERPRISE_ROUTER_ENABLED and enterprise_router is not None:
     app.include_router(enterprise_router, prefix="/api")
 
 
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    csrf_exempt_paths = (
+        "/api/auth/login",
+        "/api/auth/register",
+        "/api/auth/refresh",
+        "/api/csrf-token",
+        "/api/docs",
+        "/api/openapi.json",
+        "/metrics",
+    )
+    validate_csrf(request, csrf_exempt_paths)
+    response = await call_next(request)
+    attach_security_headers(response)
+    return response
+
+
 @app.get("/metrics", include_in_schema=False)
 async def metrics_endpoint():
     if not MONITORING_ENABLED or not metrics_response:
@@ -841,12 +872,22 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
 @app.get("/api/health", tags=["System"])
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "environment": get_settings().ENVIRONMENT,
-        "version": "1.0.0"
-    }
+    return success_response(
+        {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "environment": get_settings().ENVIRONMENT,
+            "version": "1.0.0",
+        }
+    )
+
+
+@app.get("/api/csrf-token", tags=["Security"])
+async def get_csrf_token():
+    token = os.urandom(24).hex()
+    response = JSONResponse(status_code=200, content={"success": True, "data": {"csrf_token": token}})
+    issue_csrf_cookie(response, token)
+    return response
 
 
 @app.get("/api/config-check", tags=["System"])
@@ -858,30 +899,32 @@ async def config_check():
 
     jwt_secret = os.getenv("JWT_SECRET", "")
 
-    return {
-        "environment": settings.ENVIRONMENT,
-        "files": {
-            ".env": (repo_root / ".env").exists(),
-            ".env.development": (repo_root / ".env.development").exists(),
-        },
-        "sources": {
-            "JWT_SECRET": _detect_config_source("JWT_SECRET"),
-            "DATABASE_URL": _detect_config_source("DATABASE_URL"),
-            "REDIS_URL": _detect_config_source("REDIS_URL"),
-            "ENVIRONMENT": _detect_config_source("ENVIRONMENT"),
-        },
-        "jwt": {
-            "configured": bool(jwt_secret),
-            "length": len(jwt_secret),
-            "strong": len(jwt_secret) >= 32,
-            "algorithm": settings.JWT_ALGORITHM,
-        },
-        "sanity": {
-            "database_url_configured": bool(settings.DATABASE_URL),
-            "redis_url_configured": bool(settings.REDIS_URL),
-        },
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+    return success_response(
+        {
+            "environment": settings.ENVIRONMENT,
+            "files": {
+                ".env": (repo_root / ".env").exists(),
+                ".env.development": (repo_root / ".env.development").exists(),
+            },
+            "sources": {
+                "JWT_SECRET": _detect_config_source("JWT_SECRET"),
+                "DATABASE_URL": _detect_config_source("DATABASE_URL"),
+                "REDIS_URL": _detect_config_source("REDIS_URL"),
+                "ENVIRONMENT": _detect_config_source("ENVIRONMENT"),
+            },
+            "jwt": {
+                "configured": bool(jwt_secret),
+                "length": len(jwt_secret),
+                "strong": len(jwt_secret) >= 32,
+                "algorithm": settings.JWT_ALGORITHM,
+            },
+            "sanity": {
+                "database_url_configured": bool(settings.DATABASE_URL),
+                "redis_url_configured": bool(settings.REDIS_URL),
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    )
 
 # Authentication endpoints
 @app.post("/api/auth/register", response_model=dict, tags=["Authentication"])
@@ -916,12 +959,20 @@ async def register(request: UserRegisterRequest):
             detail="GDPR consent is required"
         )
     
+    role_value = request.role or "candidate"
+    allowed_roles = {"admin", "recruiter", "candidate", "auditor", "analyst", "user"}
+    if role_value not in allowed_roles:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+
+    normalized_role = "candidate" if role_value == "user" else role_value
+
     user_id = str(uuid4())
     mock_users[request.email] = {
         'id': user_id,
         'email': request.email,
         'password_hash': PasswordHasher.hash_password(request.password),
         'full_name': request.full_name,
+        'role': normalized_role,
         'gdpr_consent': request.gdpr_consent,
         'created_at': datetime.utcnow().isoformat(),
         'failed_login_attempts': 0,
@@ -931,11 +982,15 @@ async def register(request: UserRegisterRequest):
     
     logger.info(f"User registered: {request.email}")
     
-    return {
-        "message": "User registered successfully",
-        "user_id": user_id,
-        "email": request.email
-    }
+    return success_response(
+        {
+            "message": "User registered successfully",
+            "user_id": user_id,
+            "email": request.email,
+            "role": normalized_role,
+        },
+        status_code=201,
+    )
 
 @app.post("/api/auth/login", response_model=TokenResponse, tags=["Authentication"])
 async def login(request: UserLoginRequest):
@@ -988,12 +1043,12 @@ async def login(request: UserLoginRequest):
     )
     
     access_token = jwt_service.create_token(
-        data={"sub": request.email, "user_id": user['id']},
+        data={"sub": request.email, "user_id": user['id'], "role": user.get('role', 'candidate'), "token_type": "access"},
         expires_delta=timedelta(minutes=get_settings().JWT_EXPIRY_MINUTES)
     )
     
     refresh_token = jwt_service.create_token(
-        data={"sub": request.email, "type": "refresh"},
+        data={"sub": request.email, "user_id": user['id'], "role": user.get('role', 'candidate'), "token_type": "refresh"},
         expires_delta=timedelta(days=get_settings().REFRESH_TOKEN_EXPIRY_DAYS)
     )
     
@@ -1003,6 +1058,46 @@ async def login(request: UserLoginRequest):
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=get_settings().JWT_EXPIRY_MINUTES * 60
+    )
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+@app.post("/api/auth/refresh", tags=["Authentication"])
+async def refresh_access_token(payload: RefreshTokenRequest):
+    jwt_service = JWTService(get_settings().JWT_SECRET, get_settings().JWT_ALGORITHM)
+    decoded = jwt_service.decode_token(payload.refresh_token)
+    if decoded.get("token_type") != "refresh":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+    access_token = jwt_service.create_token(
+        data={
+            "sub": decoded.get("sub"),
+            "user_id": decoded.get("user_id"),
+            "role": decoded.get("role", "candidate"),
+            "token_type": "access",
+        },
+        expires_delta=timedelta(minutes=get_settings().JWT_EXPIRY_MINUTES),
+    )
+    return success_response(
+        {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": get_settings().JWT_EXPIRY_MINUTES * 60,
+        }
+    )
+
+
+@app.get("/api/auth/me", tags=["Authentication"])
+async def auth_me(current_user: dict = Depends(verify_token)):
+    return success_response(
+        {
+            "email": current_user.get("email"),
+            "user_id": current_user.get("user_id"),
+            "role": current_user.get("role", "candidate"),
+        }
     )
 
 # Resume endpoints
@@ -1181,10 +1276,7 @@ async def list_resumes(current_user: dict = Depends(verify_token)):
         if r.get('user_id') == user_id
     ]
     
-    return {
-        'resumes': user_resumes,
-        'total': len(user_resumes)
-    }
+    return success_response({'resumes': user_resumes, 'total': len(user_resumes)})
 
 # Verification endpoints
 
@@ -1217,14 +1309,16 @@ async def get_dashboard_stats(current_user: dict = Depends(verify_token)):
     # Add some realistic variation to fake detection count
     base_fake = 200 + len(mock_resumes) * 5
     
-    return {
-        "total_resumes": total_resumes,
-        "total_verified": total_verified,
-        "average_trust_score": average_trust,
-        "fake_resumes_detected": base_fake + fake_count,
-        "processing_queue_length": max(0, len([r for r in mock_resumes.values() if r.get('status') == 'processing'])),
-        "average_processing_time_seconds": 30 + random.randint(-10, 10)
-    }
+    return success_response(
+        {
+            "total_resumes": total_resumes,
+            "total_verified": total_verified,
+            "average_trust_score": average_trust,
+            "fake_resumes_detected": base_fake + fake_count,
+            "processing_queue_length": max(0, len([r for r in mock_resumes.values() if r.get('status') == 'processing'])),
+            "average_processing_time_seconds": 30 + random.randint(-10, 10),
+        }
+    )
 
 # ===================== ERROR HANDLERS =====================
 
@@ -1232,66 +1326,31 @@ async def get_dashboard_stats(current_user: dict = Depends(verify_token)):
 async def http_exception_handler(request, exc):
     """Global HTTP exception handler"""
     logger.error(f"HTTP error: {exc.status_code} - {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": True,
-            "message": str(exc.detail),
-            "code": exc.status_code,
-        },
-    )
+    return error_response(str(exc.detail), exc.status_code)
 
 
 @app.exception_handler(ResumeVerificationError)
 async def resume_verification_error_handler(request: Request, exc: ResumeVerificationError):
     logger.exception("Resume verification error")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": True,
-            "message": exc.message,
-            "code": exc.status_code,
-        },
-    )
+    return error_response(exc.message, exc.status_code)
 
 
 @app.exception_handler(OCRProcessingError)
 async def ocr_processing_error_handler(request: Request, exc: OCRProcessingError):
     logger.exception("OCR processing error")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": True,
-            "message": exc.message,
-            "code": exc.status_code,
-        },
-    )
+    return error_response(exc.message, exc.status_code)
 
 
 @app.exception_handler(BlockchainError)
 async def blockchain_error_handler(request: Request, exc: BlockchainError):
     logger.exception("Blockchain error")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": True,
-            "message": exc.message,
-            "code": exc.status_code,
-        },
-    )
+    return error_response(exc.message, exc.status_code)
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc):
     """Global exception handler"""
     logger.exception(f"Unhandled exception: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": True,
-            "message": "Internal server error",
-            "code": 500,
-        },
-    )
+    return error_response("Internal server error", 500)
 
 # ===================== ENTRY POINT =====================
 

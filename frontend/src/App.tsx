@@ -77,6 +77,8 @@ interface ResumeData {
   claims?: Claim[];
   predictions?: MLPrediction[];
   blockchain_hash?: string;
+  processing_stage?: string;
+  processing_progress?: number;
 }
 
 interface UploadResponse {
@@ -85,6 +87,14 @@ interface UploadResponse {
   message: string;
   processing_job_id: string;
 }
+
+const getApiErrorMessage = (err: any, fallback: string): string => {
+  const payload = err?.response?.data;
+  if (!payload) return fallback;
+  if (typeof payload?.message === "string") return payload.message;
+  if (typeof payload?.detail === "string") return payload.detail;
+  return fallback;
+};
 
 // ===================== TRUST SCORE GAUGE =====================
 
@@ -162,7 +172,7 @@ const LoginComponent: React.FC<{ onLoginSuccess: (token: string) => void }> = ({
         setError("Invalid response");
       }
     } catch (err: any) {
-      setError(err?.response?.data?.detail || "Failed to authenticate");
+      setError(getApiErrorMessage(err, "Failed to authenticate"));
     } finally {
       setLoading(false);
     }
@@ -291,7 +301,7 @@ const ResumeUploadComponent: React.FC<{ onUploadSuccess: (id: string) => void; t
       setFile(null);
       setProgress(0);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || "Upload failed");
+      setError(getApiErrorMessage(err, "Upload failed"));
     } finally {
       setUploading(false);
     }
@@ -485,8 +495,8 @@ const App: React.FC = () => {
         if (res.data.status === "processing") {
           timer = setTimeout(poll, 3000);
         }
-      } catch {
-        setError("Fetch failed");
+      } catch (err: any) {
+        setError(getApiErrorMessage(err, "Fetch failed"));
       } finally {
         setLoading(false);
       }
@@ -577,6 +587,12 @@ const App: React.FC = () => {
 
           {error && <Alert severity="error">{error}</Alert>}
           {loading && <LinearProgress sx={{ mb: 2 }} />}
+          {data?.status === "processing" && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              {data.processing_stage || "Verification in progress..."}
+              {typeof data.processing_progress === "number" ? ` (${data.processing_progress}%)` : ""}
+            </Alert>
+          )}
 
           <Grid container spacing={3}>
             <Grid item xs={12} md={4}>

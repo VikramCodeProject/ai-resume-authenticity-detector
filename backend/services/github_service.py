@@ -97,9 +97,15 @@ class GitHubVerificationService:
                     repos_data = []
                 if isinstance(events_data, Exception):
                     events_data = []
+
+                repo_commit_count = await self._fetch_repo_commits_count(
+                    session,
+                    username,
+                    repos_data,
+                )
             
             # Extract metrics
-            metrics = self._extract_metrics(user_data, repos_data, events_data)
+            metrics = self._extract_metrics(user_data, repos_data, events_data, repo_commit_count)
             
             # Compute authenticity score
             score_breakdown = self._compute_authenticity_score(
@@ -186,7 +192,8 @@ class GitHubVerificationService:
         self, 
         user_data: Dict, 
         repos_data: List[Dict],
-        events_data: List[Dict]
+        events_data: List[Dict],
+        repo_commit_count: int,
     ) -> Dict:
         """Extract key metrics from API data"""
         # Repository metrics
@@ -215,6 +222,7 @@ class GitHubVerificationService:
             1 for event in events_data 
             if event.get('type') == 'PushEvent'
         )
+        total_recent_commits = commit_count + repo_commit_count
         
         # Repository quality indicators
         repos_with_description = sum(1 for repo in repos_data if repo.get('description'))
@@ -231,7 +239,9 @@ class GitHubVerificationService:
             'language_distribution': dict(language_distribution),
             'account_age_days': account_age_days,
             'days_since_last_activity': days_since_activity,
-            'recent_commit_count': commit_count,
+            'recent_event_commit_count': commit_count,
+            'recent_repo_commit_count': repo_commit_count,
+            'recent_commit_count': total_recent_commits,
             'repos_with_description': repos_with_description,
             'avg_stars_per_repo': round(total_stars / max(total_repos, 1), 2),
             'profile_complete': bool(user_data.get('bio') and user_data.get('location')),
@@ -239,6 +249,42 @@ class GitHubVerificationService:
             'following': user_data.get('following', 0),
             'hireable': user_data.get('hireable', False)
         }
+
+    async def _fetch_repo_commits_count(
+        self,
+        session: aiohttp.ClientSession,
+        username: str,
+        repos_data: List[Dict],
+        max_repos: int = 5,
+    ) -> int:
+        """Estimate recent commit volume by sampling top updated repositories."""
+        if not repos_data:
+            return 0
+
+        tasks = []
+        for repo in repos_data[:max_repos]:
+            repo_name = repo.get("name")
+            if not repo_name:
+                continue
+            url = f"{self.BASE_URL}/repos/{username}/{repo_name}/commits"
+            params = {"per_page": 30}
+            tasks.append(session.get(url, headers=self.headers, params=params))
+
+        if not tasks:
+            return 0
+
+        count = 0
+        for coro in asyncio.as_completed(tasks):
+            try:
+                response = await coro
+                async with response:
+                    if response.status == 200:
+                        commits = await response.json()
+                        if isinstance(commits, list):
+                            count += len(commits)
+            except Exception:
+                continue
+        return count
     
     def _compute_authenticity_score(
         self, 

@@ -5,7 +5,7 @@ AES-256 encryption for sensitive data at rest
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf import pbkdf2
 from cryptography.hazmat.backends import default_backend
 import os
 import base64
@@ -29,7 +29,19 @@ class EncryptionManager:
             master_key: Master encryption key (must be 32+ chars in production)
         """
         if master_key is None:
-            master_key = os.getenv("ENCRYPTION_KEY", "dev-encryption-key-change-in-production-12345678")
+            master_key = os.getenv("ENCRYPTION_KEY", "")
+
+        if not master_key:
+            if os.getenv("ENVIRONMENT", "development") == "production":
+                raise ValueError("ENCRYPTION_KEY must be configured in production")
+
+            if os.getenv("ALLOW_INSECURE_DEV_ENCRYPTION", "false").lower() == "true":
+                master_key = "unsafe-local-encryption-key"
+                logger.warning("Using insecure development encryption key")
+            else:
+                raise ValueError(
+                    "ENCRYPTION_KEY is required. Set ALLOW_INSECURE_DEV_ENCRYPTION=true only for local development"
+                )
         
         self.master_key = master_key
         self._cipher_suite = None
@@ -39,7 +51,7 @@ class EncryptionManager:
         """Initialize Fernet cipher with key derivation"""
         # Derive a key from master_key using PBKDF2
         salt = b'resume_verify_salt'  # In production, use random salt per key
-        kdf = PBKDF2(
+        kdf = pbkdf2.PBKDF2(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,

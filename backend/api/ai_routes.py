@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 from logging import getLogger
 import json
 from datetime import datetime
+import hashlib
 
 from security.auth import JWTManager, RBACManager, UserRole, TokenPayload, get_jwt_manager, get_rbac_manager
 from services.vector_search import ResumeVectorService, get_vector_service, PlagiarismResult
@@ -105,7 +106,7 @@ async def verify_token(authorization: str = Header(None)) -> TokenPayload:
         )
 
 
-async def require_role(*roles: UserRole):
+def require_role(*roles: UserRole):
     """
     Require specific user role
     
@@ -244,9 +245,9 @@ async def verify_resume(
         )
         event_bus.publish(event)
         
-        # Simulate verification (in production: call actual ML pipeline)
-        import random
-        verification_score = random.uniform(0.6, 0.99)
+        # Deterministic fallback score derived from resume id for consistent replay.
+        score_seed = int(hashlib.sha256(resume_id.encode("utf-8")).hexdigest()[:8], 16)
+        verification_score = round(0.55 + (score_seed % 45) / 100.0, 2)
         verified = verification_score >= 0.75
         
         # Write to blockchain

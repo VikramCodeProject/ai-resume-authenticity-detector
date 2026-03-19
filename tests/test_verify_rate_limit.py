@@ -27,13 +27,14 @@ def test_verify_github_rate_limit_11th_request_returns_429():
     limiter.request_history.clear()
     client = TestClient(app, base_url="http://127.0.0.1")
 
-    with patch("api.routes.verify_github.delay", side_effect=RuntimeError("redis unavailable")):
-        statuses = _post_n_times(
-            client,
-            "/api/verify/github",
-            11,
-            json={"username": "testuser", "claimed_skills": ["python"]},
-        )
+    # Rate limit check happens before Celery task submission,
+    # so we don't need to patch the task itself
+    statuses = _post_n_times(
+        client,
+        "/api/verify/github",
+        11,
+        json={"username": "testuser", "claimed_skills": ["python"]},
+    )
 
     _assert_10_then_429(statuses)
 
@@ -42,18 +43,17 @@ def test_verify_full_rate_limit_11th_request_returns_429():
     limiter.request_history.clear()
     client = TestClient(app, base_url="http://127.0.0.1")
 
-    with patch("api.routes.verify_full.delay", side_effect=RuntimeError("redis unavailable")):
-        statuses = _post_n_times(
-            client,
-            "/api/verify/full",
-            11,
-            json={
-                "resume_id": "resume-123",
-                "github_username": "testuser",
-                "claimed_skills": ["python"],
-                "certificate_image_paths": [],
-            },
-        )
+    statuses = _post_n_times(
+        client,
+        "/api/verify/full",
+        11,
+        json={
+            "resume_id": "resume-123",
+            "github_username": "testuser",
+            "claimed_skills": ["python"],
+            "certificate_image_paths": [],
+        },
+    )
 
     _assert_10_then_429(statuses)
 
@@ -62,14 +62,13 @@ def test_verify_resume_rate_limit_11th_request_returns_429():
     limiter.request_history.clear()
     client = TestClient(app, base_url="http://127.0.0.1")
 
-    with patch("api.routes.verify_resume_ai.delay", side_effect=RuntimeError("redis unavailable")):
-        statuses = [
-            client.post(
-                "/api/verify/resume",
-                files={"file": ("resume.txt", b"sample resume content", "text/plain")},
-            ).status_code
-            for _ in range(11)
-        ]
+    statuses = [
+        client.post(
+            "/api/verify/resume",
+            files={"file": ("resume.txt", b"sample resume content", "text/plain")},
+        ).status_code
+        for _ in range(11)
+    ]
 
     _assert_10_then_429(statuses)
 
